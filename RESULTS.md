@@ -2,8 +2,9 @@
 
 > **Note:** This document will be updated as training progresses.
 > Current results reflect the proof-of-concept quick-test (100 gradient steps),
-> the completed Phase 1 clean run (Epochs 1–5), and the completed Phase 2 run
-> (Epochs 6–18, encoder unfrozen, manually stopped).
+> the completed Phase 1 clean run (Epochs 1–5), the completed Phase 2 run
+> (Epochs 6–18, encoder unfrozen, manually stopped), and the Phase 3
+> translucency experiment (unsuccessful, documented below for transparency).
 >
 > **Ground Truth Correction (March 2026):** A L/R channel swap affecting one film's
 > frames (44660–87549, 42,890 frames, ~2.4% of training data) was discovered
@@ -444,7 +445,7 @@ All 18 epochs achieved best Val-Loss ★
 
 ---
 
-## Final Training Metrics
+## Final Training Metrics — S²M²cinematic (Epoch 18)
 
 Training corpus: 103,029 GT anchor frames across 23 original
 stereoscopic source materials (1953–2018).
@@ -460,5 +461,62 @@ stereoscopic source materials (1953–2018).
 | Epochs with ★ | 18/18 (100%) |
 | Train/Val crossover | Epoch 15 |
 
-Next: S²M²translucent fine-tuning (3–5 epochs) for improved handling of
-translucent and fine-structure objects (foliage, glass, hair).
+**Epoch 18 is the final S²M²cinematic model.**
+
+---
+
+## Phase 3 — Translucency Experiment (Unsuccessful)
+
+### Motivation
+
+S²M²cinematic shows reduced accuracy on transparent and semi-transparent
+materials (glass, foliage, water). A TranslucencyLoss was designed as a 5th
+loss component to improve depth estimation in these regions, using three
+detection signals: low stereo confidence, binocular photometric mismatch,
+and disparity gradients without corresponding image edges.
+
+### Approach
+
+The TranslucencyLoss (`translucency_loss.py`) detects potentially transparent
+pixels and applies boosted L1 weighting in those regions, encouraging the model
+to predict correct disparity despite low stereo confidence.
+
+### Experiments
+
+Three configurations were tested, all starting from the Epoch 18 checkpoint:
+
+| Attempt | Encoder | w_sign | w_trans | boost | LR Dec | LR Enc | Result |
+|---------|---------|--------|---------|-------|--------|--------|--------|
+| 1 | Unfrozen | 0.5 | 0.5 | 3.0 | 1e-5 | 1e-6 | NegPix collapsed to 0% |
+| 2 | Unfrozen | 1.0 | 0.1 | 1.5 | 5e-6 | 5e-7 | P98 collapsed (3–22px) |
+| 3 | **Frozen** | 1.0 | 0.05 | 1.5 | 2.5e-6 | — | P98 collapsed (3–23px) |
+
+### Reference Frame Degradation (Attempt 3, Ep 19 vs. Ep 18)
+
+| Frame | P98 Ep18 | P98 Ep19 | Asym Ep18 | Asym Ep19 |
+|-------|----------|----------|-----------|-----------|
+| frame_043420 | 43.3px | 23.5px | 1.00 | 0.74 |
+| frame_050768 | 23.4px | 4.0px | 1.52 | 1.98 |
+| frame_068500 | 32.7px | 3.1px | 0.95 | 1.00 |
+| frame_1037074 | 20.3px | 4.0px | 1.00 | 1.00 |
+
+### Analysis
+
+All three attempts showed the same pattern: the TranslucencyLoss destabilized
+the disparity scale (P98 collapse), regardless of weight configuration or
+encoder freezing. The heuristic transparency detection (confidence + mismatch +
+gradient) produces too many false positives, injecting noise into the gradient
+signal that overwhelms the model's learned depth representation.
+
+### Conclusion
+
+The heuristic-based TranslucencyLoss approach is insufficient for improving
+transparency handling in S²M²cinematic. Architecturally-founded approaches
+— such as DepthFocus (Samsung, CVPR 2026), TranScene (multi-label stereo
+matching), or dedicated real-stereo transparency training data — are more
+promising paths for future work.
+
+**The Epoch 18 checkpoint remains the final S²M²cinematic model.**
+The bidirectional core competency (negative + positive disparity from
+professional stereoscopic cinema) is fully intact and represents a capability
+no other public model achieves.

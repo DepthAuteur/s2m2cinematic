@@ -19,9 +19,8 @@ Kernidee:
   ist ein starkes Signal das kein synthetisches Dataset braucht.
 
 Datenquelle:
-  Echte Filme! Professionell stereographierte Spielfilme und IMAX-Produktionen
-  enthalten reichlich transparente Materialien: Unterwasserszenen, Glasscheiben,
-  Hologramme, Biolumineszenz, Uhrgläser, Fenster, Aquariumglas etc.
+  Echte Filme! Titanic (Unterwasser/Glas), Avatar (Hologramme/Biolumineszenz),
+  Sea Rex (Aquariumglas), Hugo (Uhrglas/Fenster), etc.
   Keine zusätzlichen Daten, kein synthetisches Dataset, keine Roboter.
 
 Integration:

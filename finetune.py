@@ -8,14 +8,15 @@ Fine-Tuning von S²M² für bidirektionale Disparitätsschätzung
 in professioneller stereoskopischer Kinematografie.
 
 Nutzung:
-  python finetune.py --root /path/to/your/data --model_type L --full_films MyFilm
+  python finetune.py --root G:\\CCS --model_type L --full_films SeaRex
 
 Phase 1 (Epochen 1-5):   Encoder eingefroren, hohe Auflösung (1920×1056)
 Phase 2 (Epochen 6-50):  Voller Encoder+Decoder, niedrigere Auflösung (960×512)
+Phase 3 (--translucent): Nachtraining mit TranslucencyLoss (3-5 Epochen)
 
 Voraussetzungen:
   - S²M² Quellcode in ../s2m2/src/
-  - S²M² Gewichte (see S²M² repo for weight filenames)
+  - S²M² Gewichte (CH256NTR3.pth für L, CH384NTR3.pth für XL)
   - fSBS-Frames + S²M² positivity-Disparitäten (GT-Anker)
 """
 import argparse
@@ -24,6 +25,7 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -38,6 +40,7 @@ from s2m2.core.model.s2m2 import S2M2
 
 from dataset import StereoFilmDataset
 from losses import S2M2CinematicLoss
+from s2m2translucent_loss import S2M2TranslucentLoss
 
 
 def load_s2m2_model(weights_path, model_type='L', device='cpu'):
@@ -197,7 +200,7 @@ def main():
     parser.add_argument('--sample_per_film', type=int, default=2500)
     parser.add_argument('--full_films', type=str, nargs='*', default=[],
                         help='Filme die NICHT gesampelt werden (alle Frames). '
-                             'Z.B. --full_films MyFilm AnotherFilm')
+                             'Z.B. --full_films SeaRex')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--image_height', type=int, default=512,
                         help='Trainings-Bildhoehe Phase 2 / Encoder aufgetaut (muss durch 32 teilbar sein)')
@@ -217,6 +220,13 @@ def main():
                         help='Validierung alle N Epochen')
     parser.add_argument('--restart', action='store_true',
                         help='Training von vorne starten (Checkpoint ignorieren)')
+    parser.add_argument('--translucent', action='store_true',
+                        help='Phase 3: Nachtraining mit TranslucencyLoss '
+                             '(startet vom letzten Checkpoint)')
+    parser.add_argument('--lr_translucent', type=float, default=2.5e-6,
+                        help='Decoder-LR fuer Phase 3 Translucent (default: 2.5e-6)')
+    parser.add_argument('--lr_translucent_encoder', type=float, default=5e-7,
+                        help='Encoder-LR fuer Phase 3 Translucent (nicht verwendet bei frozen encoder)')
     args = parser.parse_args()
 
     ROOT = Path(args.root)
@@ -228,7 +238,7 @@ def main():
     if not sbs_dir.exists():
         sbs_dir = ROOT / 'frames' / 'fSBS_3D'
     disp_dir = Path(args.disparity_dir) if args.disparity_dir else \
-        ROOT / 'disparities'
+        Path('F:/Tools/Creative_Cinematic_Stereographing/disparities')
     film_json = ROOT / 'film_structure.json'
 
     # S²M² Gewichte (Dateiname hängt vom model_type ab)
@@ -238,8 +248,8 @@ def main():
     if args.s2m2_weights:
         weights_candidates.append(Path(args.s2m2_weights))
     weights_candidates.extend([
+        Path(f'F:/Tools/Creative_Cinematic_Stereographing/s2m2/weights/pretrain_weights/{_weights_stem}.pth'),
         ROOT / 's2m2' / 'weights' / 'pretrain_weights' / f'{_weights_stem}.pth',
-        ROOT / 's2m2' / f'{_weights_stem}.pth',
     ])
     weights_path = None
     for c in weights_candidates:
@@ -247,8 +257,7 @@ def main():
             weights_path = c
             break
     if weights_path is None:
-        print(f"FEHLER: S²M² weights not found ({_weights_stem}.pth). "
-              f"Please specify --s2m2_weights /path/to/weights.pth")
+        print("FEHLER: CH384NTR3.pth nicht gefunden")
         sys.exit(1)
 
     # Device
@@ -356,6 +365,11 @@ def main():
     # SignMagnitude: aktiver Anreiz für korrekte Vorzeichen UND Magnitude via NCC.
     criterion_phase1 = S2M2CinematicLoss(w_photo=1.0, w_anchor=0.3, w_sign=1.0, w_smooth=0.1)
     criterion_phase2 = S2M2CinematicLoss(w_photo=1.0, w_anchor=0.2, w_sign=1.0, w_smooth=0.05)
+    criterion_phase3 = S2M2TranslucentLoss(
+        w_photo=1.0, w_anchor=0.2, w_sign=1.0, w_smooth=0.05, w_translucent=0.05,
+        conf_threshold=0.4, mismatch_threshold=0.08,
+        grad_threshold=2.0, boost_factor=1.5,
+    )
 
     # Phase 1: nur Decoder
     freeze_encoder(model, freeze=True)
@@ -366,15 +380,39 @@ def main():
     best_val_loss = float('inf')
     no_improve = 0
 
+    # QS-Monitor für S²M²cinematic
+    _qs_dir = Path(__file__).parent
+    if str(_qs_dir) not in sys.path:
+        sys.path.insert(0, str(_qs_dir))
+    try:
+        from qs_monitor import QSMonitor, qs_s2m2cinematic_epoch
+        qs = QSMonitor(output_dir=SAVE_DIR, stage='s2m2cinematic')
+    except ImportError:
+        qs = None
+
     # ── Checkpoint Resume ─────────────────────────────────────────────────────
     start_epoch = 1
     ckpt_latest = SAVE_DIR / 'latest.pth'
-    if ckpt_latest.exists() and not args.restart:
+
+    # Phase 3 mit --restart: lade s2m2cinematic_best.pth (nicht latest.pth!)
+    if args.translucent and args.restart:
+        ckpt_cinematic = SAVE_DIR / 's2m2cinematic_best.pth'
+        if ckpt_cinematic.exists():
+            print(f"\n  Phase 3 Neustart von {ckpt_cinematic}")
+            ckpt = torch.load(str(ckpt_cinematic), map_location=device, weights_only=False)
+            model.load_state_dict(ckpt['state_dict'])
+            start_epoch = ckpt['epoch'] + 1
+            print(f"  S²M²cinematic Gewichte geladen (Ep {ckpt['epoch']}), "
+                  f"starte Phase 3 ab Epoche {start_epoch}")
+        else:
+            print(f"\n  FEHLER: {ckpt_cinematic} nicht gefunden!")
+            print(f"  Bitte zuerst S²M²cinematic trainieren.")
+            sys.exit(1)
+    elif ckpt_latest.exists() and not args.restart:
         print(f"\n  Resume von {ckpt_latest}")
         ckpt = torch.load(str(ckpt_latest), map_location=device, weights_only=False)
         model.load_state_dict(ckpt['state_dict'])
         if ckpt.get('mid_epoch', False):
-            # Mid-Epoch-Checkpoint: Epoche von vorne, aber mit aktualisierten Gewichten
             start_epoch = ckpt['epoch']
             print(f"  Mid-Epoch Resume: Ep {start_epoch} Batch {ckpt.get('batch', '?')} "
                   f"→ Epoche {start_epoch} wird wiederholt (Gewichte beibehalten)")
@@ -386,7 +424,30 @@ def main():
 
     # ── Training ──────────────────────────────────────────────────────────────
     print(f"\n{'─' * 60}")
-    if start_epoch <= args.warmup_epochs:
+    if args.translucent:
+        print(f"  Phase 3: S²M²translucent Fine-Tuning (ab Epoche {start_epoch})")
+        print(f"  TranslucencyLoss aktiv | Encoder EINGEFROREN | LR Decoder={args.lr_translucent}")
+        # Reset Early Stopping für Phase 3
+        best_val_loss = float('inf')
+        no_improve = 0
+        # Encoder einfrieren — nur Decoder trainieren
+        # Schützt die globale Tiefenskala (P98) und Feature-Repräsentation
+        freeze_encoder(model, freeze=True)
+        decoder_params = [p for p in model.parameters() if p.requires_grad]
+        trainable = sum(p.numel() for p in decoder_params)
+        print(f"  Encoder eingefroren — {trainable/1e6:.1f}M Decoder-Parameter trainierbar")
+        optimizer = torch.optim.AdamW(
+            decoder_params, lr=args.lr_translucent, weight_decay=1e-4
+        )
+        # Scaler frisch (keine alten Scale-States von Phase 2)
+        scaler = GradScaler()
+        # DataLoader mit Phase-2-Auflösung (960×512 bleibt)
+        if start_epoch > 1:
+            del train_loader, val_loader
+            torch.cuda.empty_cache()
+            train_loader, val_loader = _create_loaders(
+                args.image_height, args.image_width)
+    elif start_epoch <= args.warmup_epochs:
         print(f"  Phase 1: Decoder Fine-Tuning (Epochen {start_epoch}-{args.warmup_epochs})")
     else:
         print(f"  Phase 2: Full Model Fine-Tuning (ab Epoche {start_epoch})")
@@ -424,7 +485,8 @@ def main():
             ], weight_decay=1e-4)
 
         # Bei Resume in Phase 2: sicherstellen dass Loader die richtige Auflösung hat
-        if epoch == start_epoch and epoch > args.warmup_epochs:
+        # NICHT bei Phase 3 (translucent) — dort wird der Encoder bewusst eingefroren
+        if epoch == start_epoch and epoch > args.warmup_epochs and not args.translucent:
             del train_loader, val_loader
             torch.cuda.empty_cache()
             train_loader, val_loader = _create_loaders(
@@ -442,10 +504,17 @@ def main():
                 {'params': decoder_params, 'lr': args.lr},
             ], weight_decay=1e-4)
 
-        criterion = criterion_phase1 if epoch <= args.warmup_epochs else criterion_phase2
+        if args.translucent:
+            criterion = criterion_phase3
+        elif epoch <= args.warmup_epochs:
+            criterion = criterion_phase1
+        else:
+            criterion = criterion_phase2
         model.train()
         epoch_loss = 0.0
         epoch_parts = {'photo': 0, 'anchor': 0, 'sign': 0, 'smooth': 0}
+        if args.translucent:
+            epoch_parts['translucent'] = 0
         n_batches = 0
 
         with tqdm(train_loader, desc=f'Ep {epoch}/{args.epochs} [Train]') as pbar:
@@ -491,7 +560,7 @@ def main():
                         'scaler': scaler.state_dict(),
                         'best_val_loss': best_val_loss,
                         'no_improve': no_improve,
-                        'phase': "P1" if epoch <= args.warmup_epochs else "P2",
+                        'phase': "P3" if args.translucent else ("P1" if epoch <= args.warmup_epochs else "P2"),
                         'mid_epoch': True,
                     }
                     torch.save(mid_ckpt, str(SAVE_DIR / 'latest.pth'))
@@ -499,12 +568,15 @@ def main():
                     pbar.write(f"  💾 Mid-Epoch Checkpoint: Ep {epoch}, "
                                f"Batch {n_batches}, Avg Loss {avg_so_far:.4f}")
 
-                pbar.set_postfix({
+                postfix_dict = {
                     'loss': f'{loss.item():.4f}',
                     'pho': f'{parts["photo"]:.4f}',
                     'anc': f'{parts["anchor"]:.4f}',
                     'sgn': f'{parts["sign"]:.4f}',
-                })
+                }
+                if args.translucent:
+                    postfix_dict['trn'] = f'{parts["translucent"]:.4f}'
+                pbar.set_postfix(postfix_dict)
 
         avg_train = epoch_loss / max(n_batches, 1)
         avg_parts = {k: v / max(n_batches, 1) for k, v in epoch_parts.items()}
@@ -513,6 +585,8 @@ def main():
         model.eval()
         val_loss = 0.0
         val_parts = {'photo': 0, 'anchor': 0, 'sign': 0, 'smooth': 0}
+        if args.translucent:
+            val_parts['translucent'] = 0
         n_val = 0
 
         with torch.no_grad():
@@ -541,26 +615,123 @@ def main():
         avg_val_parts = {k: v / max(n_val, 1) for k, v in val_parts.items()}
 
         # ── Logging ───────────────────────────────────────────────────────────
-        phase = "P1" if epoch <= args.warmup_epochs else "P2"
+        if args.translucent:
+            phase = "P3"
+        elif epoch <= args.warmup_epochs:
+            phase = "P1"
+        else:
+            phase = "P2"
         improved = avg_val < (best_val_loss - args.min_delta)
         marker = " ★" if improved else ""
 
-        print(f"  [{phase}] Ep {epoch}: Train={avg_train:.4f}  Val={avg_val:.4f}  "
+        log_line = (f"  [{phase}] Ep {epoch}: Train={avg_train:.4f}  Val={avg_val:.4f}  "
               f"Photo={avg_val_parts['photo']:.4f}  "
               f"Anchor={avg_val_parts['anchor']:.4f}  "
               f"Sign={avg_val_parts['sign']:.4f}  "
-              f"Smooth={avg_val_parts['smooth']:.4f}{marker}")
+              f"Smooth={avg_val_parts['smooth']:.4f}")
+        if args.translucent:
+            log_line += f"  Trans={avg_val_parts['translucent']:.4f}"
+        log_line += marker
+        print(log_line)
 
         # CSV-Log
         log_path = SAVE_DIR / 'training_log.csv'
         if epoch == start_epoch:
             with open(str(log_path), 'a') as f:
                 if log_path.stat().st_size == 0:
-                    f.write("epoch,phase,train_loss,val_loss,photo,anchor,sign,smooth\n")
+                    header = "epoch,phase,train_loss,val_loss,photo,anchor,sign,smooth"
+                    if args.translucent:
+                        header += ",translucent"
+                    f.write(header + "\n")
         with open(str(log_path), 'a') as f:
-            f.write(f"{epoch},{phase},{avg_train:.6f},{avg_val:.6f},"
+            csv_line = (f"{epoch},{phase},{avg_train:.6f},{avg_val:.6f},"
                     f"{avg_val_parts['photo']:.6f},{avg_val_parts['anchor']:.6f},"
-                    f"{avg_val_parts['sign']:.6f},{avg_val_parts['smooth']:.6f}\n")
+                    f"{avg_val_parts['sign']:.6f},{avg_val_parts['smooth']:.6f}")
+            if args.translucent:
+                csv_line += f",{avg_val_parts['translucent']:.6f}"
+            f.write(csv_line + "\n")
+
+        # QS-Monitoring
+        if qs is not None:
+            qs_s2m2cinematic_epoch(
+                qs, epoch=epoch, phase=phase,
+                train_loss=avg_train, val_loss=avg_val,
+                parts=avg_val_parts,
+            )
+
+        # ── Referenz-Frame-Validierung ────────────────────────────────────────
+        # 4 Referenz-Frames: Asymmetrie, NegPix, P98, Min — nach jeder Epoche
+        _ref_frames = ['frame_043420', 'frame_050768', 'frame_068500', 'frame_1037074']
+        _val_out = Path(__file__).parent / 'validation'
+        _val_out.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n  {len(_ref_frames)} Frames zum Vergleich")
+        model.eval()
+        for _stem in _ref_frames:
+            _sbs_path = sbs_dir / f'{_stem}.jpg'
+            if not _sbs_path.exists():
+                continue
+
+            # SBS laden
+            _sbs_img = cv2.imread(str(_sbs_path))
+            if _sbs_img is None:
+                continue
+            _sbs_img = cv2.cvtColor(_sbs_img, cv2.COLOR_BGR2RGB)
+            _h_sbs, _w_sbs = _sbs_img.shape[:2]
+            _half_w = _w_sbs // 2
+            _H_val, _W_val = args.image_height, args.image_width
+            _left_np = cv2.resize(_sbs_img[:, :_half_w], (_W_val, _H_val))
+            _right_np = cv2.resize(_sbs_img[:, _half_w:], (_W_val, _H_val))
+
+            _left_t = torch.from_numpy(_left_np.transpose(2, 0, 1).copy()).unsqueeze(0).contiguous().to(device)
+            _right_t = torch.from_numpy(_right_np.transpose(2, 0, 1).copy()).unsqueeze(0).contiguous().to(device)
+
+            with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                t0 = time.time()
+                _pred, _, _ = model(_left_t, _right_t)
+                _t_inf = time.time() - t0
+            _disp = _pred.squeeze().cpu().numpy().astype(np.float32)
+
+            # Statistik
+            _neg_pct = float((_disp < -0.5).sum() / _disp.size * 100)
+            _p98 = float(np.percentile(_disp, 98))
+            _dmin = float(_disp.min())
+            _W_d = _disp.shape[1]
+            _half = _W_d // 2
+            _L_med = np.median(np.abs(_disp[:, :_half][np.abs(_disp[:, :_half]) > 0.5]))
+            _R_med = np.median(np.abs(_disp[:, _half:][np.abs(_disp[:, _half:]) > 0.5]))
+            _asym = _L_med / max(_R_med, 0.01)
+
+            # GT-Anker laden für Original-Vergleich
+            _gt_npz = disp_dir / f'{_stem}.npz'
+            if _gt_npz.exists():
+                _gt_data = np.load(str(_gt_npz))
+                _gt_disp = _gt_data['disparity'].squeeze()
+                if _gt_disp.shape[0] != _H_val or _gt_disp.shape[1] != _W_val:
+                    _gt_disp = cv2.resize(_gt_disp, (_W_val, _H_val), interpolation=cv2.INTER_NEAREST)
+                _gt_p98 = float(np.percentile(_gt_disp, 98))
+                _gt_L = np.median(_gt_disp[:, :_half][_gt_disp[:, :_half] > 0.5]) \
+                    if (_gt_disp[:, :_half] > 0.5).any() else 0
+                _gt_R = np.median(_gt_disp[:, _half:][_gt_disp[:, _half:] > 0.5]) \
+                    if (_gt_disp[:, _half:] > 0.5).any() else 0
+                _gt_asym = _gt_L / max(_gt_R, 0.01)
+                print(f"  ── {_stem} ──")
+                print(f"    Cinematic: P98={_p98:.1f}px  Min={_dmin:.1f}px  "
+                      f"NegPix={_neg_pct:.1f}%  ({_t_inf:.2f}s)")
+                print(f"    Original:  P98={_gt_p98:.1f}px  Min=0.0px  ({0:.2f}s)")
+                print(f"    Asymmetrie Cinematic: L={_L_med:.2f}  R={_R_med:.2f}  "
+                      f"Ratio={_asym:.2f}")
+                print(f"    Asymmetrie Original: L={_gt_L:.2f}  R={_gt_R:.2f}  "
+                      f"Ratio={_gt_asym:.2f}")
+            else:
+                print(f"  ── {_stem} ──")
+                print(f"    Cinematic: P98={_p98:.1f}px  Min={_dmin:.1f}px  "
+                      f"NegPix={_neg_pct:.1f}%  ({_t_inf:.2f}s)")
+                print(f"    Asymmetrie: L={_L_med:.2f}  R={_R_med:.2f}  Ratio={_asym:.2f}")
+
+            print(f"    → {_val_out / _stem}_*")
+
+        print(f"  Ergebnisse in: {_val_out}\n")
 
         # ── Early Stopping ────────────────────────────────────────────────────
         if improved:
@@ -580,7 +751,8 @@ def main():
         }
         torch.save(ckpt, str(SAVE_DIR / 'latest.pth'))
         if improved:
-            torch.save(ckpt, str(SAVE_DIR / 's2m2cinematic_best.pth'))
+            best_name = 's2m2translucent_best.pth' if args.translucent else 's2m2cinematic_best.pth'
+            torch.save(ckpt, str(SAVE_DIR / best_name))
             print(f"  ★ Neuer Best Val: {best_val_loss:.4f}")
 
         # Early Stop Check (nur in Phase 2 — Phase 1 immer durchlaufen)
@@ -596,9 +768,14 @@ def main():
     print(f"  Log: {SAVE_DIR / 'training_log.csv'}")
     print(f"{'=' * 60}")
     print(f"\n  Nächster Schritt:")
-    print(f"    python validate.py --root {args.root} "
-          f"--weights {SAVE_DIR / 's2m2cinematic_best.pth'}"
-          f" --frames frame_001000 frame_005000 frame_010000")
+    if args.translucent:
+        print(f"    python validate.py --root {args.root} "
+              f"--weights {SAVE_DIR / 's2m2translucent_best.pth'}"
+              f" --frames frame_043420 frame_050768 frame_068500 frame_1037074")
+    else:
+        print(f"    python validate.py --root {args.root} "
+              f"--weights {SAVE_DIR / 's2m2cinematic_best.pth'}"
+              f" --frames frame_043420 frame_050768 frame_068500 frame_1037074")
 
 
 if __name__ == '__main__':

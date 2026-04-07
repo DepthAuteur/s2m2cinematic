@@ -335,4 +335,4 @@ Pre-trained weights (when released): **CC BY-NC 4.0**.
 
 ---
 
-*DepthAuteur — Cinephile · March 2026*
+*DepthAuteur — Cinephile · April 2026*
